@@ -1,0 +1,281 @@
+#!/usr/bin/env bash
+# git-reconcile — provenance-aware reconciliation of local work with upstream.
+#
+# A local commit (<upstream>..HEAD) counts as ALREADY MERGED if EITHER:
+#   1. its patch-id is upstream (git cherry '-'), OR
+#   2. its subject matches provenance harvested from an upstream GitHub
+#      squash-merge commit.
+#
+# GitHub squash bodies list constituent commits as "* subject" bullets, and a
+# single-commit PR's squash subject is that commit's subject plus " (#123)".
+# Checking both cases prevents replaying a commit whose content diverged after
+# its PR was merged, such as a CI-only change left on the PR branch.
+#
+# Modes:
+#   git reconcile [<upstream>]          Dry-run: print MERGED/KEEP + command.
+#   git reconcile --apply [<upstream>]  Reconcile in place with reset/cherry-pick.
+#   git reconcile --pull [<upstream>]   Fetch, prune, then reconcile in place.
+#   git reconcile --abort               Abort a paused reconciliation.
+#
+# The default upstream is @{upstream}, falling back to origin/main.
+set -euo pipefail
+
+readonly VERSION="0.1.0"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  git reconcile [<upstream>]
+  git reconcile --apply [<upstream>]
+  git reconcile --pull [<upstream>]
+  git reconcile --abort
+
+Reconcile the current branch with upstream after commits have landed there.
+Patch-equivalent commits and GitHub squash-merge provenance are treated as
+already merged; only the remaining commits are replayed.
+
+Options:
+  --apply    Rewrite the current branch onto upstream.
+  --pull     Fetch and prune the upstream remote, then apply.
+  --abort    Abort a paused survivor cherry-pick and restore the original HEAD.
+  -h, --help Show this help text.
+  --version  Print the version.
+EOF
+}
+
+mode="dry"
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+  --version) printf 'git-reconcile %s\n' "$VERSION"; exit 0 ;;
+  --apply) mode="apply"; shift ;;
+  --pull) mode="pull"; shift ;;
+  --abort) mode="abort"; shift ;;
+  --*) echo "git reconcile: unknown flag '$1'" >&2; exit 2 ;;
+esac
+
+if [ "$mode" = "abort" ] && [ "$#" -ne 0 ]; then
+  echo "git reconcile: --abort does not accept an upstream argument." >&2
+  exit 2
+fi
+if [ "$mode" != "abort" ] && [ "$#" -gt 1 ]; then
+  echo "git reconcile: expected at most one upstream argument." >&2
+  exit 2
+fi
+
+# patchid_merged is an associative array; stock macOS /bin/bash is 3.2.
+if ((BASH_VERSINFO[0] < 4)); then
+  echo "git-reconcile: needs bash >= 4 (associative arrays); found $BASH_VERSION." >&2
+  exit 1
+fi
+
+# --abort is a one-liner bail-out for a reconcile paused on a survivor
+# conflict. It only acts while a cherry-pick is live, so it can never undo an
+# already-completed reconciliation.
+if [ "$mode" = "abort" ]; then
+  gitdir="$(git rev-parse --git-dir)"
+  origfile="$gitdir/reconcile_orig"
+  if ! git rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null && [ ! -d "$gitdir/sequencer" ]; then
+    rm -f "$origfile"
+    echo "git-reconcile: no cherry-pick in progress — nothing to abort." >&2
+    exit 1
+  fi
+  git cherry-pick --abort 2>/dev/null || true
+  if [ -f "$origfile" ]; then
+    target="$(cat "$origfile")"
+    rm -f "$origfile"
+    git reset --keep "$target"
+    echo "git-reconcile: aborted — restored to ${target:0:10}, your work intact." >&2
+  else
+    echo "git-reconcile: cherry-pick aborted; no saved original HEAD, so you're at $(git rev-parse --short HEAD). Use 'git reflog' to go back further." >&2
+  fi
+  exit 0
+fi
+
+# Resolve upstream: explicit argument > tracked @{upstream} > origin/main.
+upstream="${1:-}"
+tracking_remote=""
+if [ -z "$upstream" ]; then
+  branch="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+  tracking_remote="$(git config --get "branch.$branch.remote" 2>/dev/null || true)"
+  merge_ref="$(git config --get "branch.$branch.merge" 2>/dev/null || true)"
+  if ! upstream="$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null)"; then
+    if [ -n "$tracking_remote" ] && [ -n "$merge_ref" ]; then
+      if [ "$tracking_remote" = "." ]; then
+        upstream="${merge_ref#refs/heads/}"
+      else
+        upstream="$tracking_remote/${merge_ref#refs/heads/}"
+      fi
+    else
+      upstream="origin/main"
+    fi
+  fi
+fi
+
+# Pull mode deliberately does not stash. reset --keep carries unrelated
+# tracked work forward, and the overlap path below uses a 3-way merge only when
+# a dirty tracked file also changed upstream.
+if [ "$mode" = "pull" ]; then
+  remote="${tracking_remote:-${upstream%%/*}}"
+  if [ "$remote" != "." ]; then
+    [ "$remote" = "$upstream" ] && remote="origin"
+    git fetch --prune "$remote"
+  fi
+  exec "$0" --apply "$upstream"
+fi
+
+git rev-parse -q --verify "$upstream^{commit}" >/dev/null || {
+  echo "git-reconcile: '$upstream' is not a valid commit or ref." >&2
+  exit 2
+}
+
+# Patch-id equivalence detects clean 1:1 merges, cherry-picks, and rebases.
+declare -A patchid_merged
+while read -r sign sha _; do
+  [ "$sign" = "-" ] && patchid_merged["$sha"]=1
+done < <(git cherry "$upstream")
+
+# Harvest provenance only from GitHub squash commits (subjects ending " (#123)")
+# so arbitrary changelog or revert bodies cannot donate a false match.
+squash_lines="$(git log --format='%H %s' "HEAD..$upstream" | grep -E ' \(#[0-9]+\)$' || true)"
+merged_subjects="$(printf '%s\n' "$squash_lines" | sed -E 's/^[0-9a-f]+ //; s/ \(#[0-9]+\)$//' | sort -u)"
+bullets=""
+if [ -n "$squash_lines" ]; then
+  bullets="$(printf '%s\n' "$squash_lines" | cut -d' ' -f1 \
+    | while read -r h; do git show -s --format='%b' "$h"; done \
+    | sed -nE 's/^[[:space:]]*[*-][[:space:]]+//p' | sort -u)"
+fi
+
+merged=0
+keep=()
+while read -r sha; do
+  [ -z "$sha" ] && continue
+  subj="$(git log -1 --format='%s' "$sha")"
+  # Herestrings avoid a pipefail/SIGPIPE edge case for a large bullet set.
+  if [ -n "${patchid_merged[$sha]:-}" ]; then
+    printf 'MERGED (patch-id) %.10s  %s\n' "$sha" "$subj" >&2
+    merged=$((merged + 1))
+  elif [ -n "$bullets" ] && grep -qxF -- "$subj" <<<"$bullets"; then
+    printf 'MERGED (squash)   %.10s  %s\n' "$sha" "$subj" >&2
+    merged=$((merged + 1))
+  elif [ -n "$merged_subjects" ] && grep -qxF -- "$subj" <<<"$merged_subjects"; then
+    printf 'MERGED (squash #) %.10s  %s\n' "$sha" "$subj" >&2
+    merged=$((merged + 1))
+  else
+    printf 'KEEP              %.10s  %s\n' "$sha" "$subj" >&2
+    keep+=("$sha")
+  fi
+done < <(git rev-list --reverse "$upstream..HEAD")
+echo >&2
+
+if [ "$mode" = "dry" ]; then
+  if [ "${#keep[@]}" -eq 0 ]; then
+    echo "git reset --keep $upstream"
+  else
+    echo "git reset --keep $upstream && git cherry-pick ${keep[*]}"
+  fi
+  exit 0
+fi
+
+orig="$(git rev-parse HEAD)"
+rm -f "$(git rev-parse --git-dir)/reconcile_orig"
+
+# Refuse to snapshot an in-progress operation or an unmerged index; doing so
+# would fabricate an invalid recovery commit and lose the operation state.
+if git rev-parse -q --verify MERGE_HEAD >/dev/null \
+  || git rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null \
+  || git rev-parse -q --verify REVERT_HEAD >/dev/null \
+  || [ -d "$(git rev-parse --git-path rebase-merge)" ] \
+  || [ -d "$(git rev-parse --git-path rebase-apply)" ] \
+  || [ -n "$(git ls-files --unmerged)" ]; then
+  echo "git-reconcile: a merge/cherry-pick/rebase is in progress (or the index has conflicts)." >&2
+  echo "  Finish or abort it first, then retry (nothing was changed)." >&2
+  exit 1
+fi
+
+if [ -n "$(git rev-list --merges "$upstream..HEAD")" ]; then
+  echo "git-reconcile: $upstream..HEAD contains merge commit(s), which cherry-pick can't replay." >&2
+  echo "  Flatten with 'git rebase $upstream' first, then retry (nothing was changed)." >&2
+  exit 1
+fi
+
+if [ "$merged" -eq 0 ] && git merge-base --is-ancestor "$upstream" HEAD; then
+  echo "git-reconcile: already up to date with $upstream (nothing merged, nothing to replay)." >&2
+  exit 0
+fi
+
+# An untracked path added by upstream has no common base for a safe 3-way merge.
+collisions="$(comm -12 \
+  <(git ls-files --others --exclude-standard | sort) \
+  <(git ls-tree -r --name-only "$upstream" | sort))"
+if [ -n "$collisions" ]; then
+  echo "git-reconcile: these paths are untracked locally but added by $upstream:" >&2
+  printf '%s\n' "$collisions" | sed 's/^/    /' >&2
+  echo "  Move, delete, or commit them, then retry (nothing was changed)." >&2
+  exit 1
+fi
+
+replay_survivors() {
+  [ "${#keep[@]}" -eq 0 ] && return 0
+  git cherry-pick "${keep[@]}" && return 0
+  git cherry-pick --abort 2>/dev/null || true
+  return 1
+}
+
+# Fast path: reset --keep carries unrelated tracked work forward at file
+# granularity. It exits without moving HEAD if a dirty file changed upstream.
+if git reset --keep "$upstream" 2>/dev/null; then
+  if [ "${#keep[@]}" -gt 0 ] && ! git cherry-pick "${keep[@]}"; then
+    printf '%s\n' "$orig" > "$(git rev-parse --git-dir)/reconcile_orig"
+    echo "git-reconcile: a survivor conflicts with $upstream — PAUSED to resolve (like rebase," >&2
+    echo "  with the already-merged commit(s) already dropped)." >&2
+    echo "  Fix the <<< markers, 'git add' them, then 'git cherry-pick --continue' (repeat if more)." >&2
+    echo "  Or bail out any time with: git reconcile --abort" >&2
+    exit 1
+  fi
+  echo "git-reconcile: reconciled onto $upstream (${#keep[@]} commit(s) replayed). Prev HEAD ${orig:0:10}." >&2
+  exit 0
+fi
+
+# A dirty tracked file changed upstream. Snapshot tracked WIP, reconcile a
+# clean tree, then replay that snapshot with a 3-way merge. Untracked files
+# remain untouched; only actual line overlap requires user resolution.
+snap=""
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  git add -u
+  if ! git commit --no-verify -q -m "git-reconcile WIP snapshot (throwaway; recover via reflog)"; then
+    git reset -q
+    echo "git-reconcile: could not snapshot your work (commit failed) — index restored, nothing moved." >&2
+    exit 1
+  fi
+  snap="$(git rev-parse HEAD)"
+fi
+
+if ! git reset --keep "$upstream"; then
+  echo "git-reconcile: could not move onto $upstream — restoring your working tree (nothing kept)." >&2
+  [ -n "$snap" ] && git reset --mixed -q "$orig"
+  exit 1
+fi
+if ! replay_survivors; then
+  echo "git-reconcile: genuine conflict cherry-picking a survivor — restoring original state." >&2
+  if [ -n "$snap" ]; then
+    git reset --hard "$snap"
+    git reset --mixed "$orig"
+  else
+    git reset --keep "$orig"
+  fi
+  exit 1
+fi
+
+if [ -n "$snap" ]; then
+  if git cherry-pick -n "$snap"; then
+    git reset -q
+  else
+    echo "git-reconcile: reconciled onto $upstream, but your uncommitted work overlaps the" >&2
+    echo "  upstream delta line-for-line in:" >&2
+    git diff --name-only --diff-filter=U | sed 's/^/    /' >&2
+    echo "  Resolve the <<< markers, then 'git reset' to unstage. To bail out entirely:" >&2
+    echo "    git reset --hard $snap && git reset --mixed $orig   # restores your original dirty tree" >&2
+    exit 1
+  fi
+fi
+echo "git-reconcile: reconciled onto $upstream (${#keep[@]} replayed; WIP carried by 3-way merge). Prev HEAD ${orig:0:10}." >&2
