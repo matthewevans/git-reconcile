@@ -75,6 +75,23 @@ git reconcile -h                     # Help (git reserves `--help` for man pages
 `<upstream>` defaults to the current branch's configured upstream, falling
 back to `origin/main`.
 
+### Using a fork
+
+On a fork, `origin` normally points to your fork rather than the canonical
+repository. Add the canonical repository as `upstream` once, then name its
+default branch explicitly:
+
+```sh
+git remote add upstream https://github.com/OWNER/PROJECT.git
+git reconcile --pull upstream/main
+```
+
+`--pull` fetches the remote named by its argument before reconciling, so the
+second command needs no separate `git fetch`. A bare `git reconcile --pull`
+is appropriate only when your branch already tracks `upstream/main`; a typical
+fork branch tracks `origin/<branch>` and would otherwise compare against the
+fork instead of the canonical project.
+
 ## How it works
 
 A local commit (in `<upstream>..HEAD`) counts as **MERGED** when either:
