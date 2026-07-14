@@ -1,53 +1,39 @@
 # git-reconcile
 
-Reconcile a local Git branch with its upstream after pull requests have landed
-there, including pull requests merged with GitHub's squash workflow.
+[![CI](https://github.com/matthewevans/git-reconcile/actions/workflows/ci.yml/badge.svg)](https://github.com/matthewevans/git-reconcile/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-`git reconcile` classifies each local commit as either:
+A Git subcommand that brings a local branch up to date with its upstream after
+some of its commits have already landed there. It alleviates two problems that
+make plain `git rebase` painful in that situation:
 
-- **MERGED** — represented upstream by patch equivalence, a GitHub squash
-  commit subject, or a subject listed in a GitHub squash commit body.
-- **KEEP** — not represented upstream and therefore replayed on top of the
-  current upstream tip.
+- **Diverged squash merges.** If a commit was modified after it left your
+  branch — say, a fixup made in a shipping worktree and pushed back before the
+  PR was squash-merged — the squash commit no longer patch-matches your local
+  commit. `git rebase` replays the stale commit and conflicts. `git reconcile`
+  recognizes it as already merged from the squash commit's provenance (its
+  `(#123)` subject and `* subject` body bullets) and drops it.
+- **Dirty working trees.** `git rebase` makes you stash uncommitted changes
+  first. `git reconcile` carries tracked work forward in place, falling back
+  to a 3-way merge only for files that also changed upstream.
 
-The dry run is the default. Applying the plan uses `git reset --keep` followed
-by `git cherry-pick` rather than a stash/rebase/pop sequence.
+`git reconcile` classifies every local commit as already **MERGED** upstream or
+a survivor to **KEEP**, then rebuilds the branch on the upstream tip replaying
+only the survivors:
 
-## Requirements
+```console
+$ git reconcile
+MERGED (patch-id) 9e1a4c2b10  add parser
+MERGED (squash)   6f7a8b9c0d  add parser tests
+KEEP              abcdef1234  clarify error
 
-- Git
-- Bash 4 or newer
-
-macOS ships Bash 3.2. Install a current Bash with Homebrew before using the
-tool:
-
-```sh
-brew install bash
+git reset --keep origin/main && git cherry-pick abcdef1234
 ```
 
-## Install
+The dry run above is the default and makes no changes; `--apply` executes the
+printed plan.
 
-### From a clone
-
-```sh
-git clone https://github.com/<owner>/git-reconcile.git
-cd git-reconcile
-./install.sh
-```
-
-The installer places `git-reconcile` in `$HOME/.local/bin` by default. Add
-that directory to `PATH` if needed:
-
-```sh
-export PATH="$HOME/.local/bin:$PATH"
-```
-
-Git discovers executables named `git-<command>` on `PATH`, so no Git alias
-is required.
-
-Use `git reconcile -h` for help. Git reserves `git <command> --help` for
-manual-page lookup; `git-reconcile --help` also works when invoking the
-executable directly.
+## Installation
 
 ### Homebrew
 
@@ -55,78 +41,72 @@ executable directly.
 brew install matthewevans/tap/git-reconcile
 ```
 
+### From source
+
+```sh
+git clone https://github.com/matthewevans/git-reconcile.git
+cd git-reconcile
+./install.sh          # installs to ~/.local/bin (override with PREFIX=/usr/local)
+```
+
+Make sure the install directory is on `PATH`; Git then picks up the
+`git-reconcile` executable as the `git reconcile` subcommand automatically:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+### Requirements
+
+- Git
+- Bash 4 or newer — macOS ships Bash 3.2, so `brew install bash` first
+  (the Homebrew package handles this for you)
+
 ## Usage
 
 ```sh
-# Inspect the reconciliation plan. Makes no changes.
-git reconcile [<upstream>]
-
-# Reset to upstream and replay only commits that still need to be applied.
-git reconcile --apply [<upstream>]
-
-# Fetch and prune the remote that owns upstream, then apply the plan.
-git reconcile --pull [<upstream>]
-
-# Abort a survivor cherry-pick that paused on a conflict.
-git reconcile --abort
+git reconcile [<upstream>]           # Dry run (default): print the plan, change nothing
+git reconcile --apply [<upstream>]   # Rebuild the branch on upstream, replaying survivors
+git reconcile --pull [<upstream>]    # Fetch + prune the upstream remote, then --apply
+git reconcile --abort                # Bail out of a reconciliation paused on a conflict
+git reconcile -h                     # Help (git reserves `--help` for man pages)
 ```
 
-The default upstream is the current branch's configured upstream. If none is
-configured, it is `origin/main`.
+`<upstream>` defaults to the current branch's configured upstream, falling
+back to `origin/main`.
+
+## How it works
+
+A local commit (in `<upstream>..HEAD`) counts as **MERGED** when either:
+
+- **Patch-id equivalence** — its diff matches an upstream commit
+  (`git cherry`), which covers clean merges, cherry-picks, and rebases.
+- **GitHub squash provenance** — its subject appears in an upstream squash
+  commit, either as the squash subject itself (`add parser (#42)`) or as a
+  `* subject` bullet in the squash commit body. This catches commits whose
+  content diverged before the squash landed (e.g. a fixup made in another
+  worktree or on the PR branch), where patch-id matching fails.
+
+Everything else is a **KEEP** survivor. Applying the plan runs
+`git reset --keep <upstream>` followed by `git cherry-pick <survivors>`.
 
 ## Examples
 
-### 1. Drop a patch that upstream already has
+### Continue a branch after its PR was squash-merged
 
-Suppose a teammate cherry-picks your first commit onto `main`, while your
-branch still has that commit plus a new documentation change:
-
-```mermaid
-flowchart LR
-  base["Base"] --> local_one["Topic: add parser"]
-  local_one --> local_two["Topic: add parser docs"]
-  base --> upstream_one["main: add parser"]
-  upstream_one --> reconciled["Reconciled topic: add parser docs"]
-  local_two -.->|only this commit is replayed| reconciled
-```
-
-Run the dry run first:
-
-```sh
-git reconcile origin/main
-```
+Your branch had `add parser` (A) and `add parser tests` (B). During review a
+fixup was pushed from another worktree, then the PR was squash-merged as S.
+Meanwhile you kept working and committed `clarify error` (C):
 
 ```text
-MERGED (patch-id) 9e1a4c2b10  add parser
-KEEP              7b3d9f6a42  add parser docs
-
-git reset --keep origin/main && git cherry-pick 7b3d9f6a42...
+      A---B---C     topic
+     /
+    M---------S     origin/main    S = "Add parser (#42)" = A + B + fixup
 ```
 
-The matching patch is dropped; the documentation commit is replayed on the
-current `origin/main`:
-
-```sh
-git reconcile --apply origin/main
-```
-
-### 2. Continue a branch after a GitHub squash merge
-
-A GitHub squash merge replaces several branch commits with one upstream commit.
-The squash commit's subject and body retain enough provenance for
-`git reconcile` to recognize the already-merged work:
-
-```mermaid
-flowchart LR
-  base["Base"] --> parser["Topic: add parser"]
-  parser --> tests["Topic: add parser tests"]
-  tests --> follow_up["Topic: clarify error"]
-  base --> squash["main: Add parser (#42)"]
-  squash --> result["Reconciled topic: clarify error"]
-  follow_up -.->|replayed| result
-```
-
-If the upstream squash commit is:
+Because of the fixup, A and B no longer patch-match S, so
+`git rebase origin/main` would replay them onto S and conflict. The squash
+commit still names them in its body:
 
 ```text
 Add parser (#42)
@@ -135,101 +115,93 @@ Add parser (#42)
 * add parser tests
 ```
 
-then the dry run on the still-open topic branch reports:
+so `git reconcile` classifies them as merged and replays only the survivor:
 
-```text
+```console
+$ git reconcile --apply
 MERGED (squash)   1a2b3c4d5e  add parser
 MERGED (squash)   6f7a8b9c0d  add parser tests
 KEEP              abcdef1234  clarify error
+
+git-reconcile: reconciled onto origin/main (1 commit(s) replayed). Prev HEAD 3c9d1e07aa.
 ```
 
-Only `clarify error` is replayed. This is useful when you keep working on a
-branch after its earlier pull request has been squash-merged.
-
-### 3. Fetch, reconcile, and keep work in progress
-
-`--pull` fetches the configured upstream remote, then applies the same plan
-as `--apply`. It does not use `git stash`.
-
-```mermaid
-sequenceDiagram
-  participant Developer
-  participant Reconcile as "git reconcile"
-  participant Remote as "origin/main"
-  Developer->>Reconcile: git reconcile --pull
-  Reconcile->>Remote: fetch and prune
-  Reconcile->>Reconcile: classify MERGED and KEEP commits
-  alt Dirty file is unchanged upstream
-    Reconcile->>Reconcile: reset --keep and preserve WIP
-  else Dirty file also changed upstream
-    Reconcile->>Reconcile: snapshot tracked WIP and 3-way replay it
-  end
-  Reconcile->>Developer: replay KEEP commits and retain WIP when mergeable
+```text
+              C'    topic
+             /
+    M-------S       origin/main
 ```
 
-For example, while on `feature/login`:
+### Fetch and reconcile while keeping work in progress
+
+`--pull` fetches the upstream remote, then applies the plan, with no stash
+step. Say you have an uncommitted edit to `docs.md`, your one commit A was
+squash-merged as S, and upstream has since gained T:
+
+```text
+    working tree: docs.md modified (uncommitted)
+
+      A             topic
+     /
+    M---S---T       origin/main    S = "add parser (#7)" = A
+```
+
+```console
+$ git reconcile --pull
+MERGED (squash #) 1a2b3c4d5e  add parser
+
+git-reconcile: reconciled onto origin/main (0 commit(s) replayed). Prev HEAD 3c9d1e07aa.
+```
+
+```text
+    working tree: docs.md still modified — never stashed
+
+            topic
+            v
+    M---S---T       origin/main
+```
+
+If T had also touched `docs.md`, the edit would be replayed with a 3-way
+merge, leaving only genuinely overlapping lines for manual resolution.
+
+### Resolve or abort a conflicting survivor
+
+A survivor commit can genuinely conflict with upstream. `--apply` then pauses
+at a standard cherry-pick conflict:
 
 ```sh
-# You have an unstaged edit in README.md and new commits are on origin/main.
-git reconcile --pull
-```
-
-If the edit is unrelated to upstream changes, it remains in the working tree.
-If both sides changed the same file, the command uses a 3-way replay: disjoint
-hunks carry forward automatically, while actual overlapping lines are left for
-you to resolve.
-
-### 4. Resolve or abort a survivor conflict
-
-Some `KEEP` commits can genuinely conflict with upstream. In that case,
-`git reconcile --apply` pauses at the normal cherry-pick conflict:
-
-```sh
-git reconcile --apply origin/main
-
-# Resolve conflict markers, then continue the remaining survivor commits.
-git add path/to/resolved-file
+# Fix the conflict markers, then:
+git add <resolved files>
 git cherry-pick --continue
-```
 
-To discard the partial reconciliation and return to the original branch tip:
-
-```sh
+# Or discard the partial reconciliation and restore the original branch tip:
 git reconcile --abort
 ```
 
 ## Safety model
 
-- A dry run prints the exact `git reset --keep … && git cherry-pick …` command
-  it would use.
+- The dry run is the default and prints the exact command `--apply` would run.
 - `--apply` refuses to start during a merge, rebase, revert, cherry-pick, or
-  unresolved index conflict.
-- Local merge commits are rejected because they cannot be replayed safely by
-  `git cherry-pick`.
-- An untracked path that upstream would create is rejected rather than
-  overwritten.
-- Uncommitted tracked work is carried forward when possible. If a dirty file
-  also changed upstream, the tool snapshots the tracked work, reconciles the
-  branch, and replays it with a 3-way merge.
-- If a survivor commit conflicts, resolve it and run
-  `git cherry-pick --continue`, or restore the prior tip with
-  `git reconcile --abort`.
+  with unresolved index conflicts, and rejects local merge commits (they
+  cannot be replayed by `git cherry-pick`).
+- Untracked files that upstream would overwrite are detected and block the
+  run rather than being clobbered.
+- Uncommitted tracked work survives: `git reset --keep` carries unrelated
+  changes forward, and overlapping files are replayed with a 3-way merge.
+- On failure, the tool restores the original branch tip and working tree;
+  `git reconcile --abort` recovers from a paused conflict.
 
-GitHub squash provenance intentionally uses exact, case-sensitive commit
-subjects. This reduces false positives, but generic duplicate subjects can
-still be ambiguous. Always review the dry-run table before applying it.
+Squash provenance matches commit subjects exactly and case-sensitively to
+minimize false positives, but generic duplicate subjects can still be
+ambiguous — review the dry-run table before applying.
 
 ## Development
 
 ```sh
-make lint
-make test
+make lint   # bash -n syntax checks
+make test   # integration suite against throwaway repos
 ```
-
-The integration suite covers patch-id detection, GitHub squash provenance,
-applying a reconciliation with tracked work in progress, conflict abort, and
-fetch-before-apply behavior.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+[MIT](LICENSE)
