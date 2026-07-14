@@ -51,10 +51,8 @@ executable directly.
 
 ### Homebrew
 
-After a release and tap are available:
-
 ```sh
-brew install <owner>/tap/git-reconcile
+brew install matthewevans/tap/git-reconcile
 ```
 
 ## Usage
