@@ -239,6 +239,7 @@ test_pull_fetches_then_applies() {
   local publisher="$tmpdir/publisher"
   setup_repo "$repo"
   git init -q --bare "$remote"
+  git -C "$remote" symbolic-ref HEAD refs/heads/main
   git -C "$repo" remote add upstream "$remote"
   git -C "$repo" push -q -u upstream main
 
