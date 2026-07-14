@@ -4,8 +4,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 A Git subcommand that brings a local branch up to date with its upstream after
-some of its commits have already landed there. It alleviates two problems that
-make plain `git rebase` painful in that situation:
+the two have diverged. It alleviates several problems that make plain
+`git rebase` painful in that situation:
 
 - **Diverged squash merges.** If a commit was modified after it left your
   branch — say, a fixup made in a shipping worktree and pushed back before the
@@ -16,6 +16,11 @@ make plain `git rebase` painful in that situation:
 - **Dirty working trees.** `git rebase` makes you stash uncommitted changes
   first. `git reconcile` carries tracked work forward in place, falling back
   to a 3-way merge only for files that also changed upstream.
+- **Divergent local and remote commits.** When both your branch and its
+  upstream have gained commits, `git reconcile --pull` replaces the
+  fetch/stash/rebase/pop dance with one step: it fetches, drops any local
+  commit upstream already has, and replays the rest onto the new tip — with a
+  dry-run plan available first.
 
 `git reconcile` classifies every local commit as already **MERGED** upstream or
 a survivor to **KEEP**, then rebuilds the branch on the upstream tip replaying
