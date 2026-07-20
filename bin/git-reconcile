@@ -20,7 +20,7 @@
 # The default upstream is @{upstream}, falling back to origin/main.
 set -euo pipefail
 
-readonly VERSION="0.1.0"
+readonly VERSION="0.2.0"
 
 usage() {
   cat <<'EOF'
@@ -221,61 +221,178 @@ replay_survivors() {
   return 1
 }
 
-# Fast path: reset --keep carries unrelated tracked work forward at file
-# granularity. It exits without moving HEAD if a dirty file changed upstream.
-if git reset --keep "$upstream" 2>/dev/null; then
-  if [ "${#keep[@]}" -gt 0 ] && ! git cherry-pick "${keep[@]}"; then
-    printf '%s\n' "$orig" > "$(git rev-parse --git-dir)/reconcile_orig"
-    echo "git-reconcile: a survivor conflicts with $upstream — PAUSED to resolve (like rebase," >&2
-    echo "  with the already-merged commit(s) already dropped)." >&2
-    echo "  Fix the <<< markers, 'git add' them, then 'git cherry-pick --continue' (repeat if more)." >&2
-    echo "  Or bail out any time with: git reconcile --abort" >&2
+apply_materialized() {
+  # Fast path: reset --keep carries unrelated tracked work forward at file
+  # granularity. It exits without moving HEAD if a dirty file changed upstream.
+  if git reset --keep "$upstream" 2>/dev/null; then
+    if [ "${#keep[@]}" -gt 0 ] && ! git cherry-pick "${keep[@]}"; then
+      printf '%s\n' "$orig" > "$(git rev-parse --git-dir)/reconcile_orig"
+      echo "git-reconcile: a survivor conflicts with $upstream — PAUSED to resolve (like rebase," >&2
+      echo "  with the already-merged commit(s) already dropped)." >&2
+      echo "  Fix the <<< markers, 'git add' them, then 'git cherry-pick --continue' (repeat if more)." >&2
+      echo "  Or bail out any time with: git reconcile --abort" >&2
+      exit 1
+    fi
+    echo "git-reconcile: reconciled onto $upstream (${#keep[@]} commit(s) replayed). Prev HEAD ${orig:0:10}." >&2
+    exit 0
+  fi
+
+  # A dirty tracked file changed upstream. Snapshot tracked WIP, reconcile a
+  # clean tree, then replay that snapshot with a 3-way merge. Untracked files
+  # remain untouched; only actual line overlap requires user resolution.
+  snap=""
+  if ! git diff --quiet || ! git diff --cached --quiet; then
+    git add -u
+    if ! git commit --no-verify -q -m "git-reconcile WIP snapshot (throwaway; recover via reflog)"; then
+      git reset -q
+      echo "git-reconcile: could not snapshot your work (commit failed) — index restored, nothing moved." >&2
+      exit 1
+    fi
+    snap="$(git rev-parse HEAD)"
+  fi
+
+  if ! git reset --keep "$upstream"; then
+    echo "git-reconcile: could not move onto $upstream — restoring your working tree (nothing kept)." >&2
+    [ -n "$snap" ] && git reset --mixed -q "$orig"
     exit 1
   fi
-  echo "git-reconcile: reconciled onto $upstream (${#keep[@]} commit(s) replayed). Prev HEAD ${orig:0:10}." >&2
+  if ! replay_survivors; then
+    echo "git-reconcile: genuine conflict cherry-picking a survivor — restoring original state." >&2
+    if [ -n "$snap" ]; then
+      git reset --hard "$snap"
+      git reset --mixed "$orig"
+    else
+      git reset --keep "$orig"
+    fi
+    exit 1
+  fi
+  if [ -n "$snap" ]; then
+    if git cherry-pick -n "$snap"; then
+      git reset -q
+    else
+      echo "git-reconcile: reconciled onto $upstream, but your uncommitted work overlaps the" >&2
+      echo "  upstream delta line-for-line in:" >&2
+      git diff --name-only --diff-filter=U | sed 's/^/    /' >&2
+      echo "  Resolve the <<< markers, then 'git reset' to unstage. To bail out entirely:" >&2
+      echo "    git reset --hard $snap && git reset --mixed $orig   # restores your original dirty tree" >&2
+      exit 1
+    fi
+  fi
+  echo "git-reconcile: reconciled onto $upstream (${#keep[@]} replayed; WIP carried by 3-way merge). Prev HEAD ${orig:0:10}." >&2
   exit 0
-fi
+}
 
-# A dirty tracked file changed upstream. Snapshot tracked WIP, reconcile a
-# clean tree, then replay that snapshot with a 3-way merge. Untracked files
-# remain untouched; only actual line overlap requires user resolution.
-snap=""
-if ! git diff --quiet || ! git diff --cached --quiet; then
-  git add -u
-  if ! git commit --no-verify -q -m "git-reconcile WIP snapshot (throwaway; recover via reflog)"; then
+apply_in_core() {
+  local tip sha tree_output tree status
+  local author_name author_email author_date message new_tip
+  local has_wip=0 wip_tree snap final_output final_tree w
+
+  tip="$(git rev-parse "$upstream^{commit}")"
+  for sha in "${keep[@]}"; do
+    # --merge-base=<parent> cannot represent a root commit. Let cherry-pick
+    # handle that vanishingly rare case rather than changing its behavior.
+    if ! git rev-parse -q --verify "$sha^" >/dev/null; then
+      apply_materialized
+    fi
+
+    if tree_output="$(git merge-tree --write-tree --merge-base="$sha^" "$tip" "$sha")"; then
+      tree="${tree_output%%$'\n'*}"
+    else
+      status=$?
+      # Do not use merge-tree's conflicted tree: the materialized path owns
+      # the paused cherry-pick UX and its --abort bookkeeping.
+      if [ "$status" -eq 1 ]; then
+        apply_materialized
+      fi
+      echo "git-reconcile: git merge-tree failed replaying ${sha:0:10} (exit $status); nothing was changed." >&2
+      exit 1
+    fi
+
+    {
+      IFS= read -r -d '' author_name
+      IFS= read -r -d '' author_email
+      IFS= read -r author_date
+    } < <(git log -1 --format='%an%x00%ae%x00%aD' "$sha")
+    message="$(git log -1 --format=%B "$sha")"
+
+    # In-core replay keeps a redundant survivor as an empty-diff commit
+    # rather than pausing for cherry-pick's interactive empty-commit prompt.
+    if ! new_tip="$(GIT_AUTHOR_NAME="$author_name" GIT_AUTHOR_EMAIL="$author_email" GIT_AUTHOR_DATE="$author_date" \
+      git commit-tree "$tree" -p "$tip" <<<"$message")"; then
+      echo "git-reconcile: could not recreate survivor ${sha:0:10}; nothing was changed." >&2
+      exit 1
+    fi
+    tip="$new_tip"
+  done
+
+  if ! git diff --quiet || ! git diff --cached --quiet; then
+    has_wip=1
+    # Stage only tracked paths so untracked files remain outside every step.
+    git add -u
+    if ! wip_tree="$(git write-tree)" \
+      || ! snap="$(git commit-tree "$wip_tree" -p "$orig" -m "git-reconcile WIP snapshot (throwaway; recover via reflog)")"; then
+      git reset -q
+      echo "git-reconcile: could not snapshot your work (commit failed) — index restored, nothing moved." >&2
+      exit 1
+    fi
+
+    if final_output="$(git merge-tree --write-tree --merge-base="$orig" "$tip" "$snap")"; then
+      final_tree="${final_output%%$'\n'*}"
+    else
+      status=$?
+      git reset -q
+      if [ "$status" -eq 1 ]; then
+        apply_materialized
+      fi
+      echo "git-reconcile: git merge-tree failed carrying WIP (exit $status); nothing was changed." >&2
+      exit 1
+    fi
+    if ! w="$(git commit-tree "$final_tree" -p "$tip" -m "git-reconcile WIP overlay (throwaway)")"; then
+      git reset -q
+      echo "git-reconcile: could not create the WIP overlay; nothing was changed." >&2
+      exit 1
+    fi
+  fi
+
+  if [ "$has_wip" -eq 0 ]; then
+    # This is the only worktree materialization pass; --keep skips equal blobs.
+    if ! git reset --keep "$tip"; then
+      echo "git-reconcile: could not move onto $upstream — nothing was changed." >&2
+      exit 1
+    fi
+    echo "git-reconcile: reconciled onto $upstream (${#keep[@]} commit(s) replayed). Prev HEAD ${orig:0:10}." >&2
+    exit 0
+  fi
+
+  # Point HEAD at the snapshot without checking out files, then make the one
+  # materialization pass from the user's actual WIP tree to its merged result.
+  if ! git update-ref -m "git-reconcile: WIP snapshot" HEAD "$snap"; then
     git reset -q
     echo "git-reconcile: could not snapshot your work (commit failed) — index restored, nothing moved." >&2
     exit 1
   fi
-  snap="$(git rev-parse HEAD)"
-fi
-
-if ! git reset --keep "$upstream"; then
-  echo "git-reconcile: could not move onto $upstream — restoring your working tree (nothing kept)." >&2
-  [ -n "$snap" ] && git reset --mixed -q "$orig"
-  exit 1
-fi
-if ! replay_survivors; then
-  echo "git-reconcile: genuine conflict cherry-picking a survivor — restoring original state." >&2
-  if [ -n "$snap" ]; then
-    git reset --hard "$snap"
-    git reset --mixed "$orig"
-  else
-    git reset --keep "$orig"
-  fi
-  exit 1
-fi
-
-if [ -n "$snap" ]; then
-  if git cherry-pick -n "$snap"; then
-    git reset -q
-  else
-    echo "git-reconcile: reconciled onto $upstream, but your uncommitted work overlaps the" >&2
-    echo "  upstream delta line-for-line in:" >&2
-    git diff --name-only --diff-filter=U | sed 's/^/    /' >&2
-    echo "  Resolve the <<< markers, then 'git reset' to unstage. To bail out entirely:" >&2
-    echo "    git reset --hard $snap && git reset --mixed $orig   # restores your original dirty tree" >&2
+  if ! git reset --keep "$w"; then
+    echo "git-reconcile: could not apply the WIP overlay; reconciliation stopped at the snapshot." >&2
+    echo "  Restore your original dirty tree with: git reset --mixed $orig" >&2
     exit 1
   fi
+  git reset -q --mixed "$tip"
+  echo "git-reconcile: reconciled onto $upstream (${#keep[@]} replayed; WIP carried by 3-way merge). Prev HEAD ${orig:0:10}." >&2
+}
+
+# git merge-tree --write-tree was added in Git 2.38. Older clients retain the
+# established materialized flow rather than risking a partial reconciliation.
+merge_tree_write_tree_supported=0
+if [[ "$(git --version)" =~ ([0-9]+)\.([0-9]+) ]]; then
+  git_major="${BASH_REMATCH[1]}"
+  git_minor="${BASH_REMATCH[2]}"
+  if ((git_major > 2 || (git_major == 2 && git_minor >= 38))); then
+    merge_tree_write_tree_supported=1
+  fi
 fi
-echo "git-reconcile: reconciled onto $upstream (${#keep[@]} replayed; WIP carried by 3-way merge). Prev HEAD ${orig:0:10}." >&2
+
+if [ "$merge_tree_write_tree_supported" -eq 1 ]; then
+  apply_in_core
+else
+  apply_materialized
+fi

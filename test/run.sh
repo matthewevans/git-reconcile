@@ -30,6 +30,15 @@ assert_contains() {
   [[ "$haystack" == *"$needle"* ]] || fail "$message: missing '$needle'"
 }
 
+mtime() {
+  local value
+  if value="$(stat -f %m "$1" 2>/dev/null)" && [[ "$value" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$value"
+  else
+    stat -c %Y "$1"
+  fi
+}
+
 setup_repo() {
   local repo=$1
   git init -q -b main "$repo"
@@ -43,7 +52,7 @@ setup_repo() {
 }
 
 test_help_and_version() {
-  assert_eq "$("$tool" --version)" "git-reconcile 0.1.0" "version"
+  assert_eq "$("$tool" --version)" "git-reconcile 0.2.0" "version"
   assert_contains "$("$tool" --help)" "git reconcile --apply" "help"
 }
 
@@ -180,6 +189,99 @@ test_apply_three_way_carries_overlapping_file_wip() {
   [ -f "$repo/feature.txt" ] || fail "surviving commit should be replayed after 3-way WIP merge"
 }
 
+test_apply_keeps_unchanged_file_mtimes() {
+  local repo="$tmpdir/apply-mtimes"
+  local stable_mtime wip_mtime
+  setup_repo "$repo"
+
+  # Multi-line file.txt so an upstream edit at the top and a WIP append at the
+  # bottom 3-way-merge cleanly instead of conflicting.
+  printf 'top\nmiddle\nbottom\n' > "$repo/file.txt"
+  printf 'stable\n' > "$repo/stable.txt"
+  git -C "$repo" add file.txt stable.txt
+  git -C "$repo" commit -q -m "add stable file"
+
+  git -C "$repo" switch -q -c topic
+  printf 'feature\n' > "$repo/feature.txt"
+  git -C "$repo" add feature.txt
+  git -C "$repo" commit -q -m "add feature"
+
+  git -C "$repo" switch -q main
+  printf 'upstream top\nmiddle\nbottom\n' > "$repo/file.txt"
+  git -C "$repo" add file.txt
+  git -C "$repo" commit -q -m "upstream change"
+  git -C "$repo" switch -q topic
+
+  # file.txt is dirty AND changed upstream, so reset --keep refuses and the
+  # WIP snapshot path runs — the path that historically rewrote every WIP
+  # file (revert to upstream, then reapply) even when its content survived
+  # unchanged. wip.txt is the churn probe: WIP-only, final content identical
+  # to its current content, so a correct apply must never write it.
+  printf 'top\nmiddle\nbottom\nlocal WIP\n' > "$repo/file.txt"
+  printf 'local WIP\n' >> "$repo/wip.txt"
+  touch -t 200001010000 "$repo/stable.txt" "$repo/wip.txt"
+  stable_mtime="$(mtime "$repo/stable.txt")"
+  wip_mtime="$(mtime "$repo/wip.txt")"
+
+  (cd "$repo" && "$tool" --apply main >/dev/null 2>&1)
+
+  assert_contains "$(cat "$repo/file.txt")" "upstream top" "merged upstream change into dirty file"
+  assert_contains "$(cat "$repo/file.txt")" "local WIP" "kept WIP append in dirty file"
+  assert_eq "$(mtime "$repo/stable.txt")" "$stable_mtime" "unchanged stable file mtime"
+  assert_eq "$(mtime "$repo/wip.txt")" "$wip_mtime" "unchanged WIP file mtime"
+}
+
+test_apply_preserves_survivor_identity_and_message() {
+  local repo="$tmpdir/apply-identity"
+  local expected_message
+  setup_repo "$repo"
+
+  git -C "$repo" switch -q -c topic
+  printf 'feature\n' > "$repo/feature.txt"
+  git -C "$repo" add feature.txt
+  GIT_AUTHOR_NAME="Survivor Author" GIT_AUTHOR_EMAIL="survivor@example.com" \
+    GIT_AUTHOR_DATE="2001-02-03T04:05:06Z" \
+    git -C "$repo" commit -q -m "preserve survivor identity" -m "The complete body must survive replay."
+  expected_message="$(git -C "$repo" log -1 --format=%B)"
+
+  git -C "$repo" switch -q main
+  printf 'upstream\n' > "$repo/upstream.txt"
+  git -C "$repo" add upstream.txt
+  git -C "$repo" commit -q -m "upstream change"
+  git -C "$repo" switch -q topic
+
+  (cd "$repo" && "$tool" --apply main >/dev/null)
+
+  assert_eq "$(git -C "$repo" log -1 --format='%an %ae %s')" \
+    "Survivor Author survivor@example.com preserve survivor identity" "survivor identity"
+  assert_eq "$(git -C "$repo" log -1 --format=%B)" "$expected_message" "survivor message"
+}
+
+test_apply_wip_conflict_uses_materialized_fallback() {
+  local repo="$tmpdir/apply-wip-conflict"
+  local output
+  setup_repo "$repo"
+
+  git -C "$repo" switch -q -c topic
+  printf 'feature\n' > "$repo/feature.txt"
+  git -C "$repo" add feature.txt
+  git -C "$repo" commit -q -m "add feature"
+
+  git -C "$repo" switch -q main
+  printf 'upstream\n' > "$repo/file.txt"
+  git -C "$repo" add file.txt
+  git -C "$repo" commit -q -m "upstream change"
+  git -C "$repo" switch -q topic
+  printf 'local WIP\n' > "$repo/file.txt"
+
+  if output="$(cd "$repo" && "$tool" --apply main 2>&1)"; then
+    fail "line-overlapping WIP should pause for resolution"
+  fi
+  assert_contains "$output" "uncommitted work overlaps" "WIP conflict diagnostic"
+  assert_contains "$(cat "$repo/file.txt")" "<<<<<<<" "WIP conflict markers"
+  assert_eq "$(git -C "$repo" diff --name-only --diff-filter=U)" "file.txt" "WIP conflict path"
+}
+
 test_rejects_untracked_upstream_collision() {
   local repo="$tmpdir/untracked-collision"
   local original
@@ -297,6 +399,9 @@ test_squash_subject_dry_run
 test_squash_body_dry_run
 test_apply_carries_unrelated_tracked_wip
 test_apply_three_way_carries_overlapping_file_wip
+test_apply_keeps_unchanged_file_mtimes
+test_apply_preserves_survivor_identity_and_message
+test_apply_wip_conflict_uses_materialized_fallback
 test_rejects_untracked_upstream_collision
 test_abort_restores_original_head
 test_pull_fetches_then_applies
