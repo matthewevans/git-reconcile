@@ -52,7 +52,7 @@ setup_repo() {
 }
 
 test_help_and_version() {
-  assert_eq "$("$tool" --version)" "git-reconcile 0.2.0" "version"
+  assert_eq "$("$tool" --version)" "git-reconcile 0.3.0" "version"
   assert_contains "$("$tool" --help)" "git reconcile --apply" "help"
 }
 
@@ -282,6 +282,41 @@ test_apply_wip_conflict_uses_materialized_fallback() {
   assert_eq "$(git -C "$repo" diff --name-only --diff-filter=U)" "file.txt" "WIP conflict path"
 }
 
+test_apply_flattens_merge_commit() {
+  local repo="$tmpdir/apply-merge"
+  local output
+  setup_repo "$repo"
+
+  git -C "$repo" switch -q -c topic
+  printf 'feature\n' > "$repo/feature.txt"
+  git -C "$repo" add feature.txt
+  git -C "$repo" commit -q -m "add feature"
+
+  # Advance upstream, then merge it back into topic so topic gains a merge
+  # commit whose second parent is an ancestor of the eventual upstream tip.
+  git -C "$repo" switch -q main
+  printf 'upstream one\n' > "$repo/upstream.txt"
+  git -C "$repo" add upstream.txt
+  git -C "$repo" commit -q -m "upstream one"
+  git -C "$repo" switch -q topic
+  git -C "$repo" merge -q --no-edit main
+
+  # Advance upstream again so main..topic still contains the merge commit.
+  git -C "$repo" switch -q main
+  printf 'upstream two\n' > "$repo/upstream2.txt"
+  git -C "$repo" add upstream2.txt
+  git -C "$repo" commit -q -m "upstream two"
+  git -C "$repo" switch -q topic
+
+  output="$(cd "$repo" && "$tool" --apply main 2>&1)"
+
+  assert_contains "$output" "FLATTEN (merge)" "merge commit should be flattened, not rejected"
+  git -C "$repo" merge-base --is-ancestor main HEAD || fail "upstream should be an ancestor after flatten"
+  [ -f "$repo/feature.txt" ] || fail "survivor should be replayed after flatten"
+  [ -f "$repo/upstream2.txt" ] || fail "latest upstream change should be present after flatten"
+  assert_eq "$(git -C "$repo" rev-list --count --merges main..HEAD)" "0" "no merge commit should remain after flatten"
+}
+
 test_rejects_untracked_upstream_collision() {
   local repo="$tmpdir/untracked-collision"
   local original
@@ -402,6 +437,7 @@ test_apply_three_way_carries_overlapping_file_wip
 test_apply_keeps_unchanged_file_mtimes
 test_apply_preserves_survivor_identity_and_message
 test_apply_wip_conflict_uses_materialized_fallback
+test_apply_flattens_merge_commit
 test_rejects_untracked_upstream_collision
 test_abort_restores_original_head
 test_pull_fetches_then_applies

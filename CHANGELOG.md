@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.0 - 2026-07-20
+
+- A local merge commit in `<upstream>..HEAD` is now flattened away instead of
+  aborting the run. Its unique non-merge ancestors are already enumerated by
+  the reconciliation traversal, so they are replayed individually — the same
+  result as the `git rebase <upstream>` the tool previously demanded by hand.
+
 ## 0.2.0 - 2026-07-20
 
 - Reconcile apply now replays survivors and merges tracked WIP in-core before a

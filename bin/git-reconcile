@@ -20,7 +20,7 @@
 # The default upstream is @{upstream}, falling back to origin/main.
 set -euo pipefail
 
-readonly VERSION="0.2.0"
+readonly VERSION="0.3.0"
 
 usage() {
   cat <<'EOF'
@@ -146,12 +146,22 @@ if [ -n "$squash_lines" ]; then
 fi
 
 merged=0
+flattened=0
 keep=()
-while read -r sha; do
+while read -r sha parents; do
   [ -z "$sha" ] && continue
   subj="$(git log -1 --format='%s' "$sha")"
+  # A merge commit (2+ parents) can't be cherry-picked, so it is flattened
+  # away — exactly the 'git rebase <upstream>' remedy this tool used to demand.
+  # The rev-list traversal driving this loop already lists the merge's unique
+  # non-merge ancestors individually, so they are still replayed and no local
+  # work is lost. Excluding it from keep also protects apply_in_core, whose
+  # --merge-base="$sha^" only names the first parent of a two-parent commit.
   # Herestrings avoid a pipefail/SIGPIPE edge case for a large bullet set.
-  if [ -n "${patchid_merged[$sha]:-}" ]; then
+  if [[ "$parents" == *' '* ]]; then
+    printf 'FLATTEN (merge)   %.10s  %s\n' "$sha" "$subj" >&2
+    flattened=$((flattened + 1))
+  elif [ -n "${patchid_merged[$sha]:-}" ]; then
     printf 'MERGED (patch-id) %.10s  %s\n' "$sha" "$subj" >&2
     merged=$((merged + 1))
   elif [ -n "$bullets" ] && grep -qxF -- "$subj" <<<"$bullets"; then
@@ -164,7 +174,7 @@ while read -r sha; do
     printf 'KEEP              %.10s  %s\n' "$sha" "$subj" >&2
     keep+=("$sha")
   fi
-done < <(git rev-list --reverse "$upstream..HEAD")
+done < <(git rev-list --reverse --parents "$upstream..HEAD")
 echo >&2
 
 if [ "$mode" = "dry" ]; then
@@ -189,12 +199,6 @@ if git rev-parse -q --verify MERGE_HEAD >/dev/null \
   || [ -n "$(git ls-files --unmerged)" ]; then
   echo "git-reconcile: a merge/cherry-pick/rebase is in progress (or the index has conflicts)." >&2
   echo "  Finish or abort it first, then retry (nothing was changed)." >&2
-  exit 1
-fi
-
-if [ -n "$(git rev-list --merges "$upstream..HEAD")" ]; then
-  echo "git-reconcile: $upstream..HEAD contains merge commit(s), which cherry-pick can't replay." >&2
-  echo "  Flatten with 'git rebase $upstream' first, then retry (nothing was changed)." >&2
   exit 1
 fi
 

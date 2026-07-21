@@ -204,8 +204,9 @@ git reconcile --abort
 
 - The dry run is the default and prints the exact command `--apply` would run.
 - `--apply` refuses to start during a merge, rebase, revert, cherry-pick, or
-  with unresolved index conflicts, and rejects local merge commits (they
-  cannot be replayed by `git cherry-pick`).
+  with unresolved index conflicts. Local merge commits are flattened away —
+  their unique non-merge commits are replayed individually, as `git rebase`
+  would do — rather than blocking the run.
 - Untracked files that upstream would overwrite are detected and block the
   run rather than being clobbered.
 - Uncommitted tracked work survives: `git reset --keep` carries unrelated
